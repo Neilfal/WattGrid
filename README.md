@@ -19,7 +19,12 @@ schedule, device states, and power draw) and flags statistically unusual
 combinations — e.g. AC running in an empty room — as potential waste.
 
 ## Run it locally
-1. cd backend
-2. pip install -r ../requirements.txt
-3. uvicorn main:app --reload
+1. Run: git clone https://github.com/Neilfal/WattGrid.git then cd WattGrid 
+2. Make sure Python 3.10+ is installed (python --version to check). This is the only hard prerequisite besides Git
+3. Run: python -m venv venv, then activate it — Windows: .\venv\Scripts\activate, Mac/Linux: source venv/bin/activate.
+4. Run: pip install -r requirements.txt
+5. Run: cd backend (from project root) then uvicorn main:app --reload.
+
 # then visit http://127.0.0.1:8000/docs to test /predict and /analyze
+
+# Optional: Since model.pkl, scaler.pkl, etc. are already committed to backend/, you technically don't need to retrain — but if you want to verify the training process itself works, you run: cd model-training then python train_model.py. This regenerates the model files from data/WattGrid_Database.xlsx and prints the accuracy report.
