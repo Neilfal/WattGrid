@@ -37,7 +37,6 @@ app.add_middleware(
 model = joblib.load("model.pkl")
 scaler = joblib.load("scaler.pkl")
 feature_cols = joblib.load("feature_cols.pkl")
-threshold = joblib.load("threshold.pkl")  # calibrated for high recall on waste
 
 
 # ---------------------------------------------------------------------
@@ -85,12 +84,14 @@ def _predict(df_raw: pd.DataFrame) -> pd.DataFrame:
     X = build_model_input(df_feat, feature_cols)
     X_scaled = scaler.transform(X)
 
-    scores = model.decision_function(X_scaled)     # lower = more unusual
-    flagged = scores < threshold                    # calibrated cutoff, tuned for high recall
+    predictions = model.predict(X_scaled)                    # "Yes" / "No" directly
+    probabilities = model.predict_proba(X_scaled)              # confidence per class
+    yes_index = list(model.classes_).index("Yes")
+    confidence = probabilities[:, yes_index]                    # P(waste) for each row
 
     df_raw = df_raw.copy()
-    df_raw["Predicted_Wastage"] = pd.Series(flagged).map({True: "Yes", False: "No"}).values
-    df_raw["Anomaly_Score"] = scores
+    df_raw["Predicted_Wastage"] = predictions
+    df_raw["Waste_Confidence"] = confidence
     return df_raw
 
 
@@ -114,7 +115,7 @@ def predict_single(reading: Reading):
     row = result.iloc[0]
     return {
         "predicted_wastage": row["Predicted_Wastage"],
-        "anomaly_score": float(row["Anomaly_Score"]),
+        "waste_confidence": float(row["Waste_Confidence"]),
     }
 
 
@@ -132,7 +133,7 @@ async def analyze_bulk(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
 
-    df_raw = df_raw.dropna(how="all")
+    df_raw = df_raw.dropna(subset=["Room"])
 
     try:
         result = _predict(df_raw)
