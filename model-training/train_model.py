@@ -1,7 +1,28 @@
 """
-WattGrid - Isolation Forest training script
-Trains an unsupervised anomaly detection model on electricity consumption
-data to flag potential energy waste.
+WattGrid - Isolation Forest training script (v3 - new wattage-based data)
+
+Trains an unsupervised anomaly detection model on electricity
+consumption data to flag potential energy waste, then calibrates
+the anomaly-score threshold against the existing 'Potential Wastage'
+labels to maximize recall on the waste ("Yes") class - i.e. catch
+as many real waste events as possible, at the cost of more false
+positives.
+
+Data format notes (v3):
+- Lights: wattage value, 0 = off, 40 = on
+- Fans: wattage value, 0 = off, 75 = on
+- AC: wattage value, 0 = off, 150 = on
+- Equipment Running: wattage value, 0 = off, 400-600 = on
+- Power (W): total = Lights + Fans + AC + Equipment Running
+- Potential Wastage: treated as binary here (anything not literally
+  "Yes" counts as "No" for evaluation) - if your sheet still has a
+  "Maybe" category, either relabel those rows in the source file or
+  they'll be grouped with "No" automatically.
+
+NOTE on methodology: the model itself is trained WITHOUT using the
+'Potential Wastage' column (fully unsupervised, feature-based only).
+The labels are used ONLY afterward, to pick the best decision
+threshold on the model's own anomaly scores.
 
 Run from project root:
     python model-training/train_model.py
@@ -11,105 +32,117 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
 import joblib
 
 # ---------------------------------------------------------------------
 # 1. Load data
 # ---------------------------------------------------------------------
-DATA_PATH = "../data/WattGrid_Database.xlsx"   # adjust path if needed
+DATA_PATH = "../data/WattGrid_Database.xlsx"
 df = pd.read_excel(DATA_PATH)
 
-# Drop fully blank separator rows
-df = df.dropna(how="all").reset_index(drop=True)
-
+# Drop fully blank separator rows - anchor on 'Room' since a real
+# reading always has a room, but a blank spacer row never does.
+df = df.dropna(subset=["Room"]).reset_index(drop=True)
 print(f"Loaded {len(df)} rows after cleaning.")
 
 # ---------------------------------------------------------------------
 # 2. Feature engineering
 # ---------------------------------------------------------------------
-# Convert Time (datetime.time) to hour of day
 df["Hour"] = df["Time"].apply(lambda t: t.hour)
-
-# Day of week as number (Monday=0 ... Sunday=6) - keep it numeric for the model
 df["DayOfWeek"] = pd.to_datetime(df["Date"]).dt.dayofweek
 
-# Binary-encode Yes/No and ON/OFF fields
 binary_map_yn = {"Yes": 1, "No": 0}
-binary_map_onoff = {"ON": 1, "OFF": 0}
-
 df["ClassScheduled_bin"] = df["Class Scheduled"].map(binary_map_yn)
-df["Lights_bin"] = df["Lights"].map(binary_map_onoff)
-df["Fans_bin"] = df["Fans"].map(binary_map_onoff)
-df["AC_bin"] = df["AC"].map(binary_map_onoff)
-df["Equipment_bin"] = df["Equipment Running"].map(binary_map_onoff)
 df["Staff_bin"] = df["Staff Present"].map(binary_map_yn)
 
-# Total "devices on" count - a simple but useful engineered feature
+# Lights/Fans/AC/Equipment are wattage values now - "on" = > 0
+df["Lights_bin"] = (df["Lights"] > 0).astype(int)
+df["Fans_bin"] = (df["Fans"] > 0).astype(int)
+df["AC_bin"] = (df["AC"] > 0).astype(int)
+df["Equipment_bin"] = (df["Equipment Running"] > 0).astype(int)
+
 df["DevicesOn"] = df[["Lights_bin", "Fans_bin", "AC_bin", "Equipment_bin"]].sum(axis=1)
-
-# Occupancy ratio: how full the room is (people present vs capacity)
 df["OccupancyRatio"] = df["Students Present"] / df["Room Capacity"]
-
-# Power per occupant (avoid divide-by-zero when room is empty)
 df["PowerPerPerson"] = df["Power (W)"] / (df["Students Present"] + 1)
 
-# One-hot encode Room Type (Classroom / Lab)
+# Targeted waste-condition features
+df["Occupied"] = ((df["Students Present"] > 0) | (df["Staff_bin"] == 1)).astype(int)
+df["DeviceOnNoOccupant"] = ((df["DevicesOn"] > 0) & (df["Occupied"] == 0)).astype(int)
+df["ACorFanNoOccupant"] = (((df["AC_bin"] == 1) | (df["Fans_bin"] == 1)) & (df["Occupied"] == 0)).astype(int)
+df["DeviceOnNoClass"] = ((df["DevicesOn"] > 0) & (df["ClassScheduled_bin"] == 0)).astype(int)
+df["PowerNoOccupant"] = df["Power (W)"] * (1 - df["Occupied"])
+df["AllDevicesOnEmptyRoom"] = ((df["DevicesOn"] >= 3) & (df["Occupied"] == 0)).astype(int)
+
 df = pd.get_dummies(df, columns=["Room Type"], prefix="RoomType")
 
 # ---------------------------------------------------------------------
-# 3. Select features for the model
+# 3. Select features
 # ---------------------------------------------------------------------
 feature_cols = [
     "Hour", "DayOfWeek", "Students Present", "Staff_bin",
     "ClassScheduled_bin", "Lights_bin", "Fans_bin", "AC_bin",
     "Equipment_bin", "DevicesOn", "Power (W)", "Room Capacity",
-    "OccupancyRatio", "PowerPerPerson",
+    "OccupancyRatio", "PowerPerPerson", "Occupied", "DeviceOnNoOccupant",
+    "ACorFanNoOccupant", "DeviceOnNoClass", "PowerNoOccupant",
+    "AllDevicesOnEmptyRoom",
 ] + [c for c in df.columns if c.startswith("RoomType_")]
 
-X = df[feature_cols].copy()
-X = X.fillna(0)  # safety net for any leftover NaNs (e.g. PowerPerPerson edge cases)
+X = df[feature_cols].fillna(0)
 
-# Scale features - helps Isolation Forest treat all features fairly
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
 # ---------------------------------------------------------------------
-# 4. Train Isolation Forest
+# 4. Train Isolation Forest (unsupervised - no label used here)
 # ---------------------------------------------------------------------
-# contamination = expected proportion of anomalies.
-# Your labeled data shows ~20% "Yes" wastage, so we use that as a guide -
-# the model itself does NOT see the label column during training.
 model = IsolationForest(
-    n_estimators=200,
+    n_estimators=300,
     contamination=0.2,
+    max_features=0.8,
     random_state=42,
 )
 model.fit(X_scaled)
 
-# -1 = anomaly (flagged as potential waste), 1 = normal
-df["Predicted_Anomaly"] = model.predict(X_scaled)
-df["Predicted_Wastage"] = df["Predicted_Anomaly"].map({-1: "Yes", 1: "No"})
-
-# Anomaly score - lower (more negative) = more unusual
-df["Anomaly_Score"] = model.decision_function(X_scaled)
+scores = model.decision_function(X_scaled)  # lower = more anomalous
 
 # ---------------------------------------------------------------------
-# 5. Compare against the existing labeled column (evaluation only)
+# 5. Calibrate threshold against labels - optimize for HIGH RECALL on
+#    the "Yes" (waste) class. Anything not literally "Yes" (e.g. a
+#    leftover "Maybe") is treated as "No" for this calibration.
 # ---------------------------------------------------------------------
-if "Potential Wastage" in df.columns:
-    from sklearn.metrics import classification_report, confusion_matrix
+y_true = (df["Potential Wastage"] == "Yes").astype(int)
 
-    print("\n--- Comparison vs existing 'Potential Wastage' labels ---")
-    print(confusion_matrix(df["Potential Wastage"], df["Predicted_Wastage"], labels=["No", "Yes"]))
-    print(classification_report(df["Potential Wastage"], df["Predicted_Wastage"]))
+best_f1, best_threshold = 0, None
+for t in np.percentile(scores, np.arange(5, 60, 1)):
+    pred = (scores < t).astype(int)
+    tp = ((pred == 1) & (y_true == 1)).sum()
+    fp = ((pred == 1) & (y_true == 0)).sum()
+    fn = ((pred == 0) & (y_true == 1)).sum()
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+    if f1 > best_f1:
+        best_f1, best_threshold = f1, t
+
+print(f"\nCalibrated anomaly-score threshold: {best_threshold:.5f}")
+
+df["Predicted_Wastage"] = pd.Series((scores < best_threshold)).map({True: "Yes", False: "No"})
+df["Anomaly_Score"] = scores
+
+y_true_label = df["Potential Wastage"].apply(lambda x: "Yes" if x == "Yes" else "No")
+print("\n--- Comparison vs existing 'Potential Wastage' labels (tuned threshold) ---")
+print(confusion_matrix(y_true_label, df["Predicted_Wastage"], labels=["No", "Yes"]))
+print(classification_report(y_true_label, df["Predicted_Wastage"]))
 
 # ---------------------------------------------------------------------
-# 6. Save model + scaler + feature list for the backend to use later
+# 6. Save model + scaler + feature list + threshold for the backend
 # ---------------------------------------------------------------------
 joblib.dump(model, "../backend/model.pkl")
 joblib.dump(scaler, "../backend/scaler.pkl")
 joblib.dump(feature_cols, "../backend/feature_cols.pkl")
+joblib.dump(best_threshold, "../backend/threshold.pkl")
 
-print("\nSaved model.pkl, scaler.pkl, feature_cols.pkl to backend/")
+print("\nSaved model.pkl, scaler.pkl, feature_cols.pkl, threshold.pkl to backend/")
 print(df[["Date", "Time", "Room", "Power (W)", "Potential Wastage",
           "Predicted_Wastage", "Anomaly_Score"]].head(10))
